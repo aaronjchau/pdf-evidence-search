@@ -1,4 +1,4 @@
-# PDF evidence search
+# Clark System Design Demo
 
 Ask a question about a PDF; the answer cites the table cells it came from.
 
