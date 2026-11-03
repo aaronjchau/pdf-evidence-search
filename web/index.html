@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Evidence Search</title>
+<style>
+:root { --bg: #fafaf8; --card: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2dc; --accent: #2457c5; --hit: #fff1b8; --bad: #b42318; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #161615; --card: #1f1f1d; --ink: #ecebe6; --muted: #a3a29b; --line: #34332f; --accent: #7aa2ff; --hit: #5a4a10; --bad: #ff8a80; }
+}
+:root[data-theme="dark"] { --bg: #161615; --card: #1f1f1d; --ink: #ecebe6; --muted: #a3a29b; --line: #34332f; --accent: #7aa2ff; --hit: #5a4a10; --bad: #ff8a80; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 0 0 10px; }
+p { margin: 0 0 10px; }
+.muted { color: var(--muted); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-top: 16px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input[type=text], select { flex: 1 1 260px; min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); font: inherit; }
+button { padding: 9px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+button.chip { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 5px 10px; font-size: 13px; }
+pre { white-space: pre-wrap; word-break: break-word; font: 13px/1.5 ui-monospace, monospace; margin: 0; }
+.answer { font-size: 26px; font-weight: 650; }
+.bad { color: var(--bad); }
+.shot { position: relative; margin-top: 8px; border: 1px solid var(--line); }
+.shot img { display: block; width: 100%; height: auto; }
+.shot .box { position: absolute; border: 2px solid #e5484d; background: rgba(229, 72, 77, 0.12); }
+.shot .box span { position: absolute; top: -2px; right: calc(100% + 4px); background: #e5484d; color: #fff; font-size: 11px; padding: 0 4px; border-radius: 3px; }
+details { margin-top: 10px; }
+summary { cursor: pointer; color: var(--accent); }
+.page { overflow-x: auto; font-size: 13px; margin-top: 8px; }
+.page table { border-collapse: collapse; margin: 8px 0; }
+.page th, .page td { border-bottom: 1px solid var(--line); padding: 3px 8px; text-align: right; }
+.page th, .page td { white-space: nowrap; }
+.page tr th:first-child { text-align: left; white-space: normal; }
+.page p { margin: 2px 0; }
+.page .hit { background: var(--hit); outline: 2px solid var(--accent); }
+ol { margin: 0; padding-left: 20px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PDF evidence search</h1>
+  <p class="muted">Upload a PDF, ask a question, and get an answer that cites the exact table cells it came from, with their page and bounding box. The math is done in code, not by the model.</p>
+  <div class="card">
+    <h2>1. Document</h2>
+    <div class="row">
+      <select id="doc"></select>
+      <input type="file" id="file" accept="application/pdf">
+      <button id="upload">Upload</button>
+    </div>
+    <pre id="log" class="muted" style="margin-top:10px"></pre>
+  </div>
+  <div class="card">
+    <h2>2. Ask</h2>
+    <div class="row">
+      <input type="text" id="question" placeholder="How much did investments grow from 2024 to 2025?">
+      <button id="ask">Ask</button>
+    </div>
+    <div class="row" id="examples" style="margin-top:10px"></div>
+  </div>
+  <div id="result"></div>
+  <div class="card">
+    <h2>What happens</h2>
+    <ol>
+      <li><b>Client</b> (this page) asks the API for an upload URL.</li>
+      <li><b>API service</b> saves a document row in Postgres (status queued) and returns a signed URL good for 10 minutes.</li>
+      <li><b>S3</b> stand-in: the client PUTs the PDF to that URL, which saves it to storage.</li>
+      <li><b>Queue</b>: the doc ID goes on the queue.</li>
+      <li><b>OCR worker</b> reads each page (Tesseract for scanned pages) and writes one row per page: its HTML, where every cell has an id, a value and a box, and its text.</li>
+      <li><b>DLQ</b>: after 3 failed tries the document is marked failed and its ID goes on a dead-letter queue.</li>
+      <li><b>Postgres</b> holds two tables, documents and pages, with a full-text index on the page text.</li>
+      <li><b>Query service</b> finds the top 3 pages with Postgres full-text search.</li>
+      <li><b>LLM</b> (Claude Haiku 5.5) names the cells and a formula; Python checks every cell exists and does the math.</li>
+    </ol>
+  </div>
+</main>
+<script>
+const SAMPLE = { doc_id: "1c1218c1-d853-4998-8d2d-86f4f4f2b290", file_name: "Wikimedia Foundation audited statements, FY2009 to FY2025 (sample, 252 pages)" };
+const EXAMPLES = ["How much did investments grow from 2024 to 2025?", "What share of 2025 total operating expenses went to programs?",
+  "How much did total net assets grow from 2009 to 2025?", "Cash at the end of fiscal 2015", "Salaries and wages in 2025",
+  "Which firm audited the 2025 financial statements?"];
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+async function call(path, options = {}) {
+  const r = await fetch(path, options);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+
+function saved() { try { return JSON.parse(localStorage.getItem("pdf-docs")) || []; } catch (e) { return []; } }
+function remember(doc) { try { localStorage.setItem("pdf-docs", JSON.stringify([doc, ...saved()].slice(0, 10))); } catch (e) {} }
+function listDocs(pick) {
+  $("doc").innerHTML = [SAMPLE, ...saved()].map(d => `<option value="${esc(d.doc_id)}">${esc(d.file_name)}</option>`).join("");
+  if (pick) $("doc").value = pick;
+}
+
+$("upload").onclick = async () => {
+  const file = $("file").files[0];
+  if (!file) return;
+  const log = lines => $("log").textContent = lines.join("\n");
+  const lines = ["POST /documents"];
+  log(lines);
+  try {
+    const doc = await call("/documents", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ file_name: file.name }) });
+    lines.push(`  doc_id ${doc.doc_id}, status queued`, "PUT the PDF to the signed upload URL");
+    log(lines);
+    await call(doc.upload_url, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: file });
+    lines.push("  saved; doc ID on the queue", "GET /documents/" + doc.doc_id);
+    const start = Date.now();
+    let last = "";
+    while (true) {
+      const s = await call(`/documents/${doc.doc_id}`);
+      const now = s.status + (s.attempts > 1 ? ` (try ${s.attempts} of 3)` : "") + (s.error ? ` - ${s.error}` : "");
+      if (now !== last) lines.push(`  ${Math.round((Date.now() - start) / 1000)} s: ${now}`);
+      last = now;
+      log(lines);
+      if (s.status === "done") { lines.push(`  ${s.pages} pages in Postgres`); log(lines); remember({ doc_id: doc.doc_id, file_name: file.name }); listDocs(doc.doc_id); return; }
+      if (s.status === "failed") return;
+      await new Promise(done => setTimeout(done, 1500));
+    }
+  } catch (e) { lines.push("Failed: " + e.message); log(lines); }
+};
+
+function drawBoxes(img, cited) {
+  const width = img.naturalWidth / 2, height = img.naturalHeight / 2;
+  for (const c of cited) {
+    const [x0, y0, x1, y1] = c.bbox.split(",").map(Number);
+    const box = document.createElement("div");
+    box.className = "box";
+    Object.assign(box.style, { left: `${x0 / width * 100}%`, top: `${y0 / height * 100}%`, width: `${(x1 - x0) / width * 100}%`, height: `${(y1 - y0) / height * 100}%` });
+    box.innerHTML = `<span>${esc(c.name)}</span>`;
+    img.parentElement.appendChild(box);
+  }
+}
+
+$("ask").onclick = async () => {
+  const question = $("question").value.trim() || $("question").placeholder;
+  const doc = $("doc").value;
+  $("result").innerHTML = `<div class="card muted">Searching pages, then asking the model...</div>`;
+  try {
+    const r = await call(`/documents/${doc}/ask`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question }) });
+    let formula = r.plan ? r.plan.formula : "";
+    for (const c of r.cited) formula = formula.replace(new RegExp(`\\b${c.name}\\b`, "g"), c.text);
+    const cited = r.cited.map(c => `${esc(c.name)} = ${esc(c.text)}   page ${c.page}, ${esc(c.ref)}, box ${esc(c.bbox)}`).join("\n");
+    const pages = [...new Set(r.cited.map(c => c.page))];
+    $("result").innerHTML = `<div class="card">
+      <div class="answer ${r.cited.length ? "" : "bad"}">${esc(r.answer)}</div>
+      ${r.plan && r.plan.kind === "number" ? `<p class="muted">Formula: ${esc(formula)}</p>` : ""}
+      ${cited ? `<pre>${cited}</pre>` : ""}
+      <p class="muted" style="margin-top:10px">Searched <code>${esc(r.search)}</code>; top pages ${r.pages.join(", ") || "none"}.</p>
+      </div>` + pages.map(n => `<div class="card"><h2>Page ${n} of the PDF, with the cited boxes</h2>
+        <div class="shot"><img id="img-${n}" alt="Page ${n}" src="/documents/${doc}/pages/${n}/image"></div>
+        <details><summary>The same page as stored in Postgres (HTML)</summary><div class="page" id="page-${n}">Loading...</div></details></div>`).join("");
+    for (const n of pages) {
+      const img = $(`img-${n}`), mine = r.cited.filter(c => c.page === n);
+      if (img.complete && img.naturalWidth) drawBoxes(img, mine); else img.onload = () => drawBoxes(img, mine);
+      const p = await call(`/documents/${doc}/pages/${n}`);
+      $(`page-${n}`).innerHTML = p.html;
+      for (const c of mine) { const cell = $(`page-${n}`).querySelector(`[id="${c.ref}"]`); if (cell) cell.classList.add("hit"); }
+    }
+  } catch (e) { $("result").innerHTML = `<div class="card bad">${esc(e.message)}</div>`; }
+};
+
+$("question").onkeydown = e => { if (e.key === "Enter") $("ask").click(); };
+$("examples").innerHTML = EXAMPLES.map(q => `<button class="chip">${esc(q)}</button>`).join("");
+$("examples").onclick = e => { if (e.target.tagName === "BUTTON") { $("question").value = e.target.textContent; $("ask").click(); } };
+listDocs();
+</script>
+</body>
+</html>
